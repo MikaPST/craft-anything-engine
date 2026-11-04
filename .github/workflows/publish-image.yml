@@ -1,0 +1,98 @@
+name: Build and publish Craft Anything Engine
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "53 4 * * 1"
+  push:
+    branches:
+      - main
+    paths:
+      - "Dockerfile"
+      - ".github/workflows/publish-image.yml"
+      - "README.md"
+      - "docker-compose.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-craft-anything-engine
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out packaging repository
+        uses: actions/checkout@v4
+
+      - name: Check out upstream Craft Anything
+        uses: actions/checkout@v4
+        with:
+          repository: storytold/craft-anything
+          ref: main
+          path: upstream
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.0"
+
+      - name: Verify upstream workspace and lockfile
+        run: |
+          test -s upstream/Cargo.toml
+          test -s upstream/Cargo.lock
+          test -s upstream/apps/craft-anything-cli/Cargo.toml
+
+      - name: Build and smoke-test CLI on the runner architecture
+        working-directory: upstream
+        run: |
+          cargo build --release --locked --package craft-anything-cli
+          ./target/release/craft-anything-cli --help
+          ./target/release/craft-anything-cli commands --help
+          ./target/release/craft-anything-cli mcp --help
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract upstream commit
+        id: upstream
+        run: echo "sha=$(git -C upstream rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare Docker build context
+        run: |
+          mkdir -p build-context
+          cp Dockerfile build-context/Dockerfile
+          tar --exclude=.git -cf - upstream | tar -xf - -C build-context
+
+      - name: Build and push multi-platform image
+        uses: docker/build-push-action@v6
+        with:
+          context: build-context
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/craft-anything-engine:latest
+            ghcr.io/${{ github.repository_owner }}/craft-anything-engine:upstream-${{ steps.upstream.outputs.sha }}
+          labels: |
+            org.opencontainers.image.title=Craft Anything Engine
+            org.opencontainers.image.description=Native CLI and MCP server for Craft Anything
+            org.opencontainers.image.source=https://github.com/storytold/craft-anything
+            org.opencontainers.image.revision=${{ steps.upstream.outputs.sha }}
+
+      - name: Inspect published image metadata
+        run: |
+          docker buildx imagetools inspect \
+            ghcr.io/${{ github.repository_owner }}/craft-anything-engine:latest
