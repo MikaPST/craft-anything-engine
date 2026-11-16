@@ -3,7 +3,7 @@
 # Each GitHub Actions runner builds the CLI natively for its target architecture.
 # The official Rust workspace is checked out at an upstream release tag and
 # copied into the Docker build context by the publishing workflow.
-FROM rust:1.97-bookworm AS builder
+FROM rust:1.100-bookworm AS builder
 
 WORKDIR /src
 COPY upstream/ ./
