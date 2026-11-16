@@ -73,7 +73,7 @@ jobs:
 
       - name: Resolve published official Craft Anything release
         id: release
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           REQUESTED_TAG: ${{ inputs.upstream_tag }}
         with:
@@ -113,7 +113,7 @@ jobs:
 
       - name: Check whether this release has already been packaged
         id: check
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           TAG: ${{ steps.release.outputs.tag }}
           FORCE_REBUILD: ${{ inputs.force_rebuild }}
@@ -409,7 +409,7 @@ jobs:
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - name: Create or update matching GitHub Release
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
           RELEASE_NAME: ${{ needs.resolve.outputs.name }}
