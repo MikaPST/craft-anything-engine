@@ -2,97 +2,493 @@ name: Build and publish Craft Anything Engine
 
 on:
   workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Official upstream release tag (empty = latest stable release)
+        type: string
+        required: false
+      force_rebuild:
+        description: Rebuild an already packaged official release
+        type: boolean
+        required: false
+        default: false
   schedule:
-    - cron: "53 4 * * 1"
+    - cron: '47 3 * * *'
   push:
     branches:
       - main
     paths:
-      - "Dockerfile"
-      - ".github/workflows/publish-image.yml"
-      - "README.md"
-      - "docker-compose.yml"
+      - Dockerfile
+      - .dockerignore
+      - docker-compose.yml
+      - .github/workflows/publish-image.yml
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
-  group: publish-craft-anything-engine
+  group: craft-anything-engine-publish
   cancel-in-progress: false
 
-jobs:
-  build-and-push:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out packaging repository
-        uses: actions/checkout@v4
+env:
+  IMAGE_NAME: ghcr.io/mikapst/craft-anything-engine
 
-      - name: Check out upstream Craft Anything
+jobs:
+  resolve:
+    name: Resolve and validate the official upstream release
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+      tag: ${{ steps.release.outputs.tag }}
+      name: ${{ steps.release.outputs.name }}
+      url: ${{ steps.release.outputs.url }}
+      body: ${{ steps.release.outputs.body }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+      published_at: ${{ steps.release.outputs.published_at }}
+      publish_latest: ${{ steps.release.outputs.publish_latest }}
+      short_sha: ${{ steps.source.outputs.short }}
+      full_sha: ${{ steps.source.outputs.full }}
+
+    steps:
+      - name: Checkout version-controlled packaging
+        uses: actions/checkout@v4
+        with:
+          path: packaging
+          persist-credentials: false
+
+      - name: Validate packaging files and Docker Compose
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for file in Dockerfile .dockerignore docker-compose.yml README.md SECURITY.md; do
+            if [[ ! -s "packaging/$file" ]]; then
+              echo "::error::Missing or empty packaging/$file"
+              exit 1
+            fi
+          done
+
+          docker compose -f packaging/docker-compose.yml config --quiet
+          echo "Packaging files and Compose configuration are valid."
+
+      - name: Resolve published official Craft Anything release
+        id: release
+        uses: actions/github-script@v7
+        env:
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+        with:
+          script: |
+            const upstream = {
+              owner: 'storytold',
+              repo: 'craft-anything'
+            };
+
+            const requested = (process.env.REQUESTED_TAG || '').trim();
+            const latest = (await github.rest.repos.getLatestRelease(upstream)).data;
+
+            const release = requested
+              ? (await github.rest.repos.getReleaseByTag({
+                  ...upstream,
+                  tag: requested
+                })).data
+              : latest;
+
+            if (!release.tag_name || release.draft) {
+              throw new Error('No published official upstream release found');
+            }
+
+            // An older manually selected tag must never overwrite :latest.
+            const publishLatest = release.tag_name === latest.tag_name;
+
+            core.setOutput('tag', release.tag_name);
+            core.setOutput('name', release.name || `Craft Anything ${release.tag_name}`);
+            core.setOutput('url', release.html_url);
+            core.setOutput('body', release.body || 'No upstream release notes provided.');
+            core.setOutput('prerelease', String(release.prerelease));
+            core.setOutput('published_at', release.published_at || 'not specified');
+            core.setOutput('publish_latest', String(publishLatest));
+
+            core.info(`Selected upstream release: ${release.tag_name}`);
+            core.info(`Update :latest: ${publishLatest}`);
+
+      - name: Check whether this release has already been packaged
+        id: check
+        uses: actions/github-script@v7
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+        with:
+          script: |
+            let alreadyReleased = false;
+
+            try {
+              await github.rest.repos.getReleaseByTag({
+                ...context.repo,
+                tag: process.env.TAG
+              });
+              alreadyReleased = true;
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+            }
+
+            const forceRebuild = process.env.FORCE_REBUILD === 'true'
+              || context.eventName === 'push';
+            const skip = alreadyReleased && !forceRebuild;
+
+            core.setOutput('skip', String(skip));
+            core.info(skip
+              ? 'This upstream release is already packaged; skipping the build.'
+              : 'A native multi-platform build is required.');
+
+      - name: Checkout official source at selected release tag
+        if: steps.check.outputs.skip != 'true'
         uses: actions/checkout@v4
         with:
           repository: storytold/craft-anything
-          ref: main
+          ref: ${{ steps.release.outputs.tag }}
           path: upstream
+          persist-credentials: false
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.97.0"
-
-      - name: Verify upstream workspace and lockfile
+      - name: Record upstream source revision and verify CLI package
+        if: steps.check.outputs.skip != 'true'
+        id: source
+        shell: bash
         run: |
+          set -euo pipefail
+
+          test -s upstream/Cargo.toml
+          test -s upstream/Cargo.lock
+          test -s upstream/apps/craft-anything-cli/Cargo.toml
+          if grep -q 'vendor/wgpu-hal' upstream/Cargo.toml; then
+            test -f upstream/vendor/wgpu-hal/Cargo.toml
+          fi
+
+          grep -Eq '^name[[:space:]]*=[[:space:]]*"craft-anything-cli"' \
+            upstream/apps/craft-anything-cli/Cargo.toml
+
+          echo "short=$(git -C upstream rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "full=$(git -C upstream rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build native ${{ matrix.platform }} image
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout packaging repository
+        uses: actions/checkout@v4
+        with:
+          path: packaging
+          persist-credentials: false
+
+      - name: Checkout official Craft Anything release
+        uses: actions/checkout@v4
+        with:
+          repository: storytold/craft-anything
+          ref: ${{ needs.resolve.outputs.tag }}
+          path: upstream
+          persist-credentials: false
+
+      - name: Validate upstream source and expected commit
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.resolve.outputs.full_sha }}
+        run: |
+          set -euo pipefail
+
           test -s upstream/Cargo.toml
           test -s upstream/Cargo.lock
           test -s upstream/apps/craft-anything-cli/Cargo.toml
 
-      - name: Build and smoke-test CLI on the runner architecture
-        working-directory: upstream
-        run: |
-          cargo build --release --locked --package craft-anything-cli
-          ./target/release/craft-anything-cli --help
-          ./target/release/craft-anything-cli commands --help
-          ./target/release/craft-anything-cli mcp --help
+          actual_sha="$(git -C upstream rev-parse HEAD)"
+          if [[ "$actual_sha" != "$EXPECTED_SHA" ]]; then
+            echo "::error::The upstream commit does not match the resolved release."
+            exit 1
+          fi
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Prepare minimal Docker build context
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p image-context/upstream
+          cp packaging/Dockerfile packaging/.dockerignore image-context/
+
+          tar -C upstream \
+            --exclude='./.git' \
+            --exclude='./target' \
+            --exclude='./dist' \
+            -cf - . | tar -C image-context/upstream -xf -
+
+          test -s image-context/upstream/Cargo.lock
+          test -s image-context/Dockerfile
+          echo "Prepared a release-pinned Rust workspace for Docker Buildx."
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GHCR
+      - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract upstream commit
-        id: upstream
-        run: echo "sha=$(git -C upstream rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Prepare Docker build context
-        run: |
-          mkdir -p build-context
-          cp Dockerfile build-context/Dockerfile
-          tar --exclude=.git -cf - upstream | tar -xf - -C build-context
-
-      - name: Build and push multi-platform image
+      - name: Build and push image by immutable digest
+        id: image
         uses: docker/build-push-action@v6
         with:
-          context: build-context
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/craft-anything-engine:latest
-            ghcr.io/${{ github.repository_owner }}/craft-anything-engine:upstream-${{ steps.upstream.outputs.sha }}
-          labels: |
-            org.opencontainers.image.title=Craft Anything Engine
-            org.opencontainers.image.description=Native CLI and MCP server for Craft Anything
-            org.opencontainers.image.source=https://github.com/storytold/craft-anything
-            org.opencontainers.image.revision=${{ steps.upstream.outputs.sha }}
+          context: image-context
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            UPSTREAM_VERSION=${{ needs.resolve.outputs.tag }}
+            UPSTREAM_SHA=${{ needs.resolve.outputs.full_sha }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=craft-engine-${{ matrix.arch }}
+          cache-to: type=gha,scope=craft-engine-${{ matrix.arch }},mode=max
 
-      - name: Inspect published image metadata
+      - name: Smoke-test published native CLI image
+        shell: bash
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
         run: |
-          docker buildx imagetools inspect \
-            ghcr.io/${{ github.repository_owner }}/craft-anything-engine:latest
+          set -euo pipefail
+
+          image="${IMAGE_NAME}@${DIGEST}"
+          docker run --rm --network none "$image" --version
+          docker run --rm --network none "$image" --help > /dev/null
+          docker run --rm --network none "$image" commands > /dev/null
+          docker run --rm --network none "$image" mcp --help > /dev/null
+
+          echo "Native CLI smoke tests passed for ${{ matrix.platform }}."
+
+      - name: Export digest for multi-platform manifest assembly
+        shell: bash
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          digest="${DIGEST#sha256:}"
+          if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Invalid image digest: $DIGEST"
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/$digest"
+
+      - name: Upload architecture-specific image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish multi-platform tags and matching GitHub Release
+    needs:
+      - resolve
+      - build
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Download verified architecture image digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate official release image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable=${{ needs.resolve.outputs.publish_latest }}
+            type=raw,value=${{ needs.resolve.outputs.tag }}
+            type=raw,value=upstream-${{ needs.resolve.outputs.short_sha }}
+
+      - name: Assemble and publish the multi-platform manifest
+        shell: bash
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          digests=("$RUNNER_TEMP/digests/"*)
+          if [[ "${#digests[@]}" -ne 2 ]]; then
+            echo "::error::Expected exactly two validated image digests."
+            exit 1
+          fi
+
+          image_refs=()
+          for file in "${digests[@]}"; do
+            digest="$(basename "$file")"
+            if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::Unexpected digest file: $file"
+              exit 1
+            fi
+            image_refs+=("${IMAGE_NAME}@sha256:${digest}")
+          done
+
+          tag_args=()
+          while IFS= read -r tag; do
+            if [[ -n "$tag" ]]; then
+              tag_args+=(--tag "$tag")
+            fi
+          done <<< "$TAGS"
+
+          if [[ "${#tag_args[@]}" -eq 0 ]]; then
+            echo "::error::No tags generated for the selected release."
+            exit 1
+          fi
+
+          docker buildx imagetools create "${tag_args[@]}" "${image_refs[@]}"
+
+      - name: Verify the published multi-platform image
+        id: manifest
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          image="${IMAGE_NAME}:${UPSTREAM_TAG}"
+          docker buildx imagetools inspect "$image"
+          docker buildx imagetools inspect --raw "$image" > manifest.json
+
+          jq -e '
+            [.manifests[]?.platform
+              | select(.os == "linux" and
+                  (.architecture == "amd64" or .architecture == "arm64"))
+              | .architecture] | unique == ["amd64", "arm64"]
+          ' manifest.json
+
+          digest="$(docker buildx imagetools inspect "$image" --format '{{json .Manifest}}' | jq -r .digest)"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not verify published multi-platform digest."
+            exit 1
+          fi
+
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update matching GitHub Release
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          RELEASE_NAME: ${{ needs.resolve.outputs.name }}
+          RELEASE_URL: ${{ needs.resolve.outputs.url }}
+          RELEASE_NOTES: ${{ needs.resolve.outputs.body }}
+          RELEASE_PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
+          RELEASE_PUBLISHED_AT: ${{ needs.resolve.outputs.published_at }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.full_sha }}
+          SOURCE_SHORT: ${{ needs.resolve.outputs.short_sha }}
+          PUBLISH_LATEST: ${{ needs.resolve.outputs.publish_latest }}
+          IMAGE_DIGEST: ${{ steps.manifest.outputs.digest }}
+        with:
+          script: |
+            const tag = process.env.RELEASE_TAG;
+            const image = 'ghcr.io/mikapst/craft-anything-engine';
+
+            const imageTags = [
+              `- \`${image}:${tag}\``,
+              `- \`${image}:upstream-${process.env.SOURCE_SHORT}\``
+            ];
+
+            if (process.env.PUBLISH_LATEST === 'true') {
+              imageTags.unshift(`- \`${image}:latest\``);
+            }
+
+            const body = [
+              `Independent multi-platform Docker packaging for **${process.env.RELEASE_NAME}**.`,
+              '',
+              '## Published Docker images',
+              ...imageTags,
+              '- Supported platforms: `linux/amd64`, `linux/arm64`',
+              `- Manifest digest: \`${process.env.IMAGE_DIGEST}\``,
+              '',
+              '## Upstream provenance',
+              `- Official release: ${process.env.RELEASE_URL}`,
+              `- Published upstream: ${process.env.RELEASE_PUBLISHED_AT}`,
+              `- Official source commit: \`${process.env.SOURCE_SHA}\``,
+              '- Built from the upstream `Cargo.lock`, using a non-root Debian runtime.',
+              '',
+              '## Official release notes',
+              process.env.RELEASE_NOTES,
+              '',
+              '## Scope',
+              'This image contains the native Craft Anything CLI and its stdio MCP server.',
+              'It does **not** provide a web UI, persistent HTTP server, or Ghidra.',
+              'This is community-maintained packaging and **not** an official upstream release.'
+            ].join('\n');
+
+            let existing;
+            try {
+              existing = (await github.rest.repos.getReleaseByTag({
+                ...context.repo,
+                tag
+              })).data;
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+            }
+
+            const values = {
+              ...context.repo,
+              name: `Craft Anything Engine ${tag}`,
+              body,
+              draft: false,
+              prerelease: process.env.RELEASE_PRERELEASE === 'true'
+            };
+
+            if (existing) {
+              await github.rest.repos.updateRelease({
+                ...values,
+                release_id: existing.id
+              });
+            } else {
+              await github.rest.repos.createRelease({
+                ...values,
+                tag_name: tag,
+                target_commitish: context.sha
+              });
+            }
+
+            core.info(`Published image and matching GitHub Release ${tag}.`);
