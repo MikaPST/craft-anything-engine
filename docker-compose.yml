@@ -1,0 +1,22 @@
+# CLI-only service: run a command with `docker compose run --rm`, not `up -d`.
+services:
+  craft-anything-engine:
+    image: ghcr.io/mikapst/craft-anything-engine:latest
+    profiles:
+      - cli
+    init: true
+    stdin_open: true
+    tty: false
+    user: "10001:10001"
+    working_dir: /workspace
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - craft-anything-data:/data
+    command:
+      - --help
+
+volumes:
+  craft-anything-data:
