@@ -51,7 +51,7 @@ jobs:
 
     steps:
       - name: Checkout version-controlled packaging
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: packaging
           persist-credentials: false
@@ -144,7 +144,7 @@ jobs:
 
       - name: Checkout official source at selected release tag
         if: steps.check.outputs.skip != 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: storytold/craft-anything
           ref: ${{ steps.release.outputs.tag }}
@@ -192,13 +192,13 @@ jobs:
 
     steps:
       - name: Checkout packaging repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: packaging
           persist-credentials: false
 
       - name: Checkout official Craft Anything release
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: storytold/craft-anything
           ref: ${{ needs.resolve.outputs.tag }}
